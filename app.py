@@ -40,8 +40,13 @@ def load_environment_variables():
         google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
         encoded_credentials = os.getenv("ENCODED_CREDENTIALS")
         if not google_maps_api_key or not encoded_credentials:
-            raise ValueError("Both GOOGLE_MAPS_API_KEY and ENCODED_CREDENTIALS must be set.")
-        return {"google_maps_api_key": google_maps_api_key, "encoded_credentials": encoded_credentials}
+            raise ValueError(
+                "Both GOOGLE_MAPS_API_KEY and ENCODED_CREDENTIALS must be set."
+            )
+        return {
+            "google_maps_api_key": google_maps_api_key,
+            "encoded_credentials": encoded_credentials,
+        }
     except KeyError as ex:
         logging.error("Failed to load environment variables: %s", str(ex))
         raise
@@ -57,10 +62,16 @@ def initialize_clients(environment_variables):
         credentials_info = json.loads(credentials_bytes.decode("utf-8"))
 
         credentials = Credentials.from_service_account_info(
-            credentials_info, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            credentials_info,
+            scopes=[
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive",
+            ],
         )
         client = gspread.authorize(credentials)
-        return googlemaps.Client(key=environment_variables["google_maps_api_key"]), client
+        return googlemaps.Client(
+            key=environment_variables["google_maps_api_key"]
+        ), client
     except (base64.binascii.Error, json.JSONDecodeError, KeyError) as ex:
         logging.error("Failed to initialize clients: %s", str(ex))
         raise
