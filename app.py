@@ -3,6 +3,10 @@
 This script updates a Google Sheet with restaurant data from Google Maps.
 It can run directly for updates or through a Flask interface for web interaction.
 
+Requirements:
+- Google Maps API key
+- Base64-encoded Google Sheets service account credentials (json file)
+
 Improvements:
 - Added more specific error handling and logging
 - Added input validation for user-provided sheet_name
@@ -32,20 +36,19 @@ logging.basicConfig(level=logging.INFO)
 
 def load_environment_variables():
     """Fetch environment variables directly from the OS environment."""
-    return {
-        "google_maps_api_key": os.getenv("GOOGLE_MAPS_API_KEY"),
-        "encoded_credentials": os.getenv("ENCODED_CREDENTIALS"),
-    }
+    try:
+        google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+        encoded_credentials = os.getenv("ENCODED_CREDENTIALS")
+        if not google_maps_api_key or not encoded_credentials:
+            raise ValueError("Both GOOGLE_MAPS_API_KEY and ENCODED_CREDENTIALS must be set.")
+        return {"google_maps_api_key": google_maps_api_key, "encoded_credentials": encoded_credentials}
+    except KeyError as ex:
+        logging.error("Failed to load environment variables: %s", str(ex))
+        raise
 
 
 def initialize_clients(environment_variables):
     """Initialize and return Google Maps and Sheets clients using Base64-encoded credentials."""
-    gmaps = googlemaps.Client(key=environment_variables["google_maps_api_key"])
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
     try:
         # Decode the Base64-encoded credentials
         credentials_bytes = base64.b64decode(
@@ -54,10 +57,10 @@ def initialize_clients(environment_variables):
         credentials_info = json.loads(credentials_bytes.decode("utf-8"))
 
         credentials = Credentials.from_service_account_info(
-            credentials_info, scopes=scope
+            credentials_info, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         )
         client = gspread.authorize(credentials)
-        return gmaps, client
+        return googlemaps.Client(key=environment_variables["google_maps_api_key"]), client
     except (base64.binascii.Error, json.JSONDecodeError, KeyError) as ex:
         logging.error("Failed to initialize clients: %s", str(ex))
         raise
