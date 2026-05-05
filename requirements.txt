@@ -1,7 +1,3 @@
-Flask
 googlemaps
 gspread
-python-dotenv
-tqdm
 google-auth
-gunicorn

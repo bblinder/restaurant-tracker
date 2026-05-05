@@ -1,190 +1,140 @@
 #!/usr/bin/env python3
 """
-This script updates a Google Sheet with restaurant data from Google Maps.
-It can run directly for updates or through a Flask interface for web interaction.
-
-Requirements:
-- Google Maps API key
-- Base64-encoded Google Sheets service account credentials (json file)
-
-Improvements:
-- Added more specific error handling and logging
-- Added input validation for user-provided sheet_name
-- Updated error response in trigger_update function
-- Implemented pagination for retrieving and processing data in smaller chunks
-- Added logging statements for important events and errors
-- Improved documentation and comments
-- Used lazy % formatting in logging functions
+Updates a Google Sheet with restaurant data from Google Maps.
+Designed to run as a CLI tool or via GitHub Actions.
 """
 
 import os
 import argparse
 import base64
 import json
+import time
 from datetime import datetime
 import logging
 
-from flask import Flask, request, jsonify
 import googlemaps
 from google.oauth2.service_account import Credentials
 import gspread
-from tqdm import tqdm
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+def get_env_vars() -> dict:
+    """Fetch environment variables."""
+    gmaps_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    creds_b64 = os.getenv("ENCODED_CREDENTIALS")
 
-def load_environment_variables():
-    """Fetch environment variables directly from the OS environment."""
+    if not gmaps_key or not creds_b64:
+        raise ValueError("Both GOOGLE_MAPS_API_KEY and ENCODED_CREDENTIALS must be set.")
+
+    return {
+        "gmaps_key": gmaps_key,
+        "creds_b64": creds_b64,
+    }
+
+def init_clients(env_vars: dict) -> tuple:
+    """Initialize Google Maps and Sheets clients."""
     try:
-        google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-        encoded_credentials = os.getenv("ENCODED_CREDENTIALS")
-        if not google_maps_api_key or not encoded_credentials:
-            raise ValueError(
-                "Both GOOGLE_MAPS_API_KEY and ENCODED_CREDENTIALS must be set."
-            )
-        return {
-            "google_maps_api_key": google_maps_api_key,
-            "encoded_credentials": encoded_credentials,
-        }
-    except KeyError as ex:
-        logging.error("Failed to load environment variables: %s", str(ex))
-        raise
-
-
-def initialize_clients(environment_variables):
-    """Initialize and return Google Maps and Sheets clients using Base64-encoded credentials."""
-    try:
-        # Decode the Base64-encoded credentials
-        credentials_bytes = base64.b64decode(
-            environment_variables["encoded_credentials"]
-        )
-        credentials_info = json.loads(credentials_bytes.decode("utf-8"))
-
-        credentials = Credentials.from_service_account_info(
-            credentials_info,
+        creds_json = json.loads(base64.b64decode(env_vars["creds_b64"]).decode("utf-8"))
+        creds = Credentials.from_service_account_info(
+            creds_json,
             scopes=[
                 "https://spreadsheets.google.com/feeds",
                 "https://www.googleapis.com/auth/drive",
             ],
         )
-        client = gspread.authorize(credentials)
-        return googlemaps.Client(
-            key=environment_variables["google_maps_api_key"]
-        ), client
-    except (base64.binascii.Error, json.JSONDecodeError, KeyError) as ex:
-        logging.error("Failed to initialize clients: %s", str(ex))
+        sheets_client = gspread.authorize(creds)
+        gmaps_client = googlemaps.Client(key=env_vars["gmaps_key"])
+        return gmaps_client, sheets_client
+    except Exception as e:
+        logging.error("Failed to initialize clients: %s", e)
         raise
 
+def process_restaurant(gmaps, name: str, max_retries: int = 4) -> dict:
+    """Fetch address and Maps URL for a single restaurant with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            result = gmaps.places(query=name)
+            if not result.get("results"):
+                return None
 
-def update_google_sheet(sheet, gmaps, batch_size=100):
-    """Update Google Sheet with restaurant data from Google Maps."""
+            place = result["results"][0]
+            address = place.get("formatted_address")
+            place_id = place.get("place_id")
+
+            maps_url = None
+            if place_id:
+                maps_url = f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+
+            return {"address": address, "url": maps_url}
+
+        except googlemaps.exceptions.ApiError as e:
+            if e.status == "OVER_QUERY_LIMIT":
+                if attempt == max_retries - 1:
+                    logging.error("Rate limit persistently exceeded for %s after %d retries.", name, max_retries)
+                    return None
+
+                sleep_time = 2 ** attempt
+                logging.warning("Rate limited on %s. Retrying in %d seconds...", name, sleep_time)
+                time.sleep(sleep_time)
+            else:
+                logging.error("API Error for %s: %s", name, e)
+                return None
+        except Exception as e:
+            logging.error("Error fetching data for %s: %s", name, e)
+            return None
+
+    return None
+
+def update_sheet(sheet, gmaps) -> dict:
+    """Update Google Sheet with missing restaurant data."""
     headers = ["Restaurant Name", "Address", "Google Maps URL", "Date Added", "Notes"]
     data = sheet.get_all_values()
-    if data[0] != headers:
+
+    if not data or data[0] != headers:
         sheet.insert_row(headers, 1)
-        data.insert(0, headers)
+        data = sheet.get_all_values()
 
-    row_indices = [index for index, row in enumerate(data) if not row[1] or not row[2]]
-    total_rows = len(row_indices)
-    logging.info("Found %d rows to update", total_rows)
+    to_update = []
+    for i, row in enumerate(data[1:], start=2): 
+        row.extend([""] * (5 - len(row)))
+        name, address, url, date_added, _ = row[:5]
 
-    for i in tqdm(range(0, total_rows, batch_size), desc="Updating in Batches"):
-        batch_indices = row_indices[i : i + batch_size]
-        batch_data = [data[index] for index in batch_indices]
+        if name and (not address or not url):
+            to_update.append({"row_idx": i, "name": name, "date": date_added})
 
-        updated_data = []
-        for row in batch_data:
-            try:
-                restaurant, address, maps_url, date_added, _ = (row + [None] * 5)[:5]
-                if not address or not maps_url:
-                    place_result = gmaps.places(query=restaurant)
-                    first_result = (
-                        place_result["results"][0] if place_result["results"] else None
-                    )
-                    if first_result:
-                        new_address = first_result.get(
-                            "formatted_address", "No address found"
-                        )
-                        place_id = first_result.get("place_id", None)
-                        new_google_maps_url = (
-                            f"https://www.google.com/maps/place/?q=place_id:{place_id}"
-                            if place_id
-                            else "No Google Maps URL found"
-                        )
-                        updated_data.append(
-                            [
-                                new_address,
-                                new_google_maps_url,
-                                (
-                                    datetime.now().strftime("%Y-%m-%d")
-                                    if not date_added
-                                    else date_added
-                                ),
-                            ]
-                        )
-                    else:
-                        updated_data.append(row[1:4])
-                else:
-                    updated_data.append(row[1:4])
-            except googlemaps.exceptions.ApiError as ex:
-                logging.error("Google Maps API Error: %s", str(ex))
-                updated_data.append(row[1:4])
-            except Exception as ex:
-                logging.error("Failed to update row: %s", str(ex))
-                updated_data.append(row[1:4])
+    if not to_update:
+        return {"updated": 0, "total": 0}
 
-        start_row = batch_indices[0] + 1
-        end_row = batch_indices[-1] + 1
-        sheet.update(f"B{start_row}:D{end_row}", updated_data)
+    logging.info("Found %d rows to update", len(to_update))
+    updates = []
 
+    for item in to_update:
+        place_info = process_restaurant(gmaps, item["name"])
+        if place_info:
+            date_added = item["date"] or datetime.now().strftime("%Y-%m-%d")
+            updates.append({
+                "range": f"B{item['row_idx']}:D{item['row_idx']}",
+                "values": [[place_info["address"] or "No address found", place_info["url"] or "No URL found", date_added]]
+            })
 
-@app.route("/update", methods=["POST"])
-def trigger_update():
-    """Endpoint to trigger sheet update via POST request."""
-    environment_variables = load_environment_variables()
-    gmaps, client = initialize_clients(environment_variables)
+    if updates:
+        sheet.batch_update(updates)
 
-    sheet_name = request.json.get("sheet_name", "Maine Restaurants")
-    if not sheet_name:
-        return jsonify({"error": "Sheet name is required"}), 400
+    return {"updated": len(updates), "total": len(to_update)}
 
-    try:
-        sheet = client.open(sheet_name).sheet1
-        update_google_sheet(sheet, gmaps)
-        return jsonify({"message": "Sheet updated successfully"}), 200
-    except gspread.exceptions.SpreadsheetNotFound:
-        logging.error("Spreadsheet not found: %s", sheet_name)
-        return jsonify({"error": "Spreadsheet not found"}), 404
-    except Exception as ex:
-        logging.error("Failed to update sheet: %s", str(ex))
-        return jsonify({"error": "Failed to update sheet"}), 500
-
-
-def main(sheet_name="Maine Restaurants"):
-    """Main function to run updates directly from command line."""
-    environment_variables = load_environment_variables()
-    gmaps, client = initialize_clients(environment_variables)
-    sheet = client.open(sheet_name).sheet1
-    update_google_sheet(sheet, gmaps)
-    logging.info("Done Updating Restaurants Sheet!")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Update Google Sheet with restaurant data."
-    )
-    parser.add_argument(
-        "--web", action="store_true", help="Run as a web app with Flask interface"
-    )
-    parser.add_argument(
-        "--sheet",
-        default="Maine Restaurants",
-        help="Specify the Google Sheet name to update",
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Update restaurant Google Sheet.")
+    parser.add_argument("--sheet", default="Maine Restaurants", help="Sheet name")
     args = parser.parse_args()
 
-    if args.web:
-        app.run(host="0.0.0.0", debug=True, port=8080)
-    else:
-        main(args.sheet)
+    try:
+        env_vars = get_env_vars()
+        gmaps, sheets_client = init_clients(env_vars)
+        sheet = sheets_client.open(args.sheet).sheet1
+        result = update_sheet(sheet, gmaps)
+        logging.info("Completed. Updated %d/%d restaurants.", result["updated"], result["total"])
+    except Exception as e:
+        logging.error("Execution failed: %s", e)
+
+if __name__ == "__main__":
+    main()
